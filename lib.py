@@ -8,6 +8,8 @@ import datasets
 import numpy as np
 import sklearn
 import sklearn.tree
+import ctranslate2
+import transformers
 
 def prepare_dataset(
   dataset: datasets.Dataset,
@@ -89,7 +91,35 @@ def create_features(
   data: List[str],
   labels: List[str],
 ) -> List[List[int]]:
-  raise NotImplementedException
+  tokenizer = transformers.AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+
+  # Load LM
+  generation_model_path = './models/ctranslate2'
+  generator = ctranslate2.Generator(generation_model_path, device='cuda')
+
+  data_train = data[0]
+  features = [[None for _ in range(len(data_text))] for _ in range(len(prompts))]
+
+  for i, system_prompt in enumerate(prompts):
+    start_tokens = [tokenizer.convert_ids_to_tokens(tokenizer.encode(system_prompt + 'Input: ' + item + '\nOutput:')) for item in data_train]
+    s_tokens = []
+    for b in start_tokens:
+      if len(b) > 2048:
+        b = b[-2048:]
+      s_tokens.append(b)
+    start_tokens = s_tokens
+
+    step_results = generator.generate_batch(
+      #prompt=prompt_tokens,
+      #static_prompt=system_prompt_tokens,
+      start_tokens=start_tokens,
+      max_length=2,
+      sampling_topk=10,
+      sampling_temperature=0.7
+    )
+    for j, step_result in enumerate(step_results):
+      features[i][j] = step_result.sequences
+  return features
 
 
 
