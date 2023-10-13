@@ -92,10 +92,50 @@ def create_features(
   raise NotImplementedException
 
 
-def build_tree(
-  features: List[List[int]]
-) -> sklearn.tree.DecisionTreeClassifier:  
-  raise NotImplementedException
+
+class PromptTree:
+  llm: Any # language model
+  _clf: sklearn.tree.DecisionTreeClassifier # internal decision tree
+  def __init__(
+      self, 
+      llm: Any,
+      prompts: List[str],
+      data: List[str],
+      labels: List[str],
+      verbalizer: Dict[str, str],
+      max_leaf_nodes: int = 10,
+      seed: int = 42
+    ):
+      self.llm = llm
+      self.prompts = prompts
+      prompt_cache, features = create_features(
+          llm=llm, prompts=prompts, data=data, labels=labels
+      )
+      self._clf = sklearn.tree.DecisionTreeClassifier(
+        max_leaf_nodes=max_leaf_nodes,
+        random_state=seed,
+      )
+      X, y = data
+      self._clf_.fit(X, y)
+    
+  def _features_from_text(self, text: List[str]) -> List[List[int]]:
+    raise NotImplementedError
+
+  def predict_proba(self, X_text):
+      prompt_features = self._features_from_text(
+          X_text
+      )
+      return self.clf_.predict_proba(prompt_features)
+
+  def predict(self, X):
+      labels = self.predict_proba(X).argmax(axis=1)
+      return map(self.verbalizer.get, labels)
 
 
-prompts, data, labels = prepare_dataset(dataset["train"])
+prompts, data, verbalizer = prepare_dataset(dataset["train"])
+tree = PromptTree(
+    llm=llm,
+    prompts=prompts,
+    data=data,
+    verbalizer=verbalizer,
+)
