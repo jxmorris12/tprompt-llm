@@ -88,9 +88,95 @@ def create_features(
   prompts: List[str],
   data: List[str],
   labels: List[str],
+  model, tokenizer, batch_size = 20
 ) -> List[List[int]]:
-  raise NotImplementedException
+    
+    # Pretokenize and batch.
+    data_new = []
+    attn_old = []
+    answers = []
+    for i in range(0, (len(data)) - batch_size,batch_size):
+        prompts_batch = ["Input: " + data[j] + "\nOutput:" for j in range(i, i + batch_size)]
+        inputs = tokenizer(
+            prompts_batch,
+            return_tensors="pt",
+            return_attention_mask=True,
+            padding=True,
+            max_length=128,
+            truncation=True
+        )
+        attn_old.append(inputs["attention_mask"].clone())
+        data_new.append(inputs)
+        answers.append(labels[i: i + batch_size])
 
+    # Main loop
+    results = []
+    for i, prompt in enumerate(prompts):
+        print("Prompting: ", i)
+        tokens = tokenizer(
+            [prompt + ""],
+            return_tensors='pt',
+            max_length=2000,
+            truncation=True
+        ).to("cuda")
+        with torch.no_grad():
+            outputs = model.forward(**tokens)
+        
+        # Setup prompt caching
+        past_key_values_new = []
+        past_key_values = outputs["past_key_values"]
+        for i in range(len(past_key_values)):
+            past_key_values_new.append(
+                [
+                    past_key_values[i][0].expand(batch_size, -1, -1, -1),
+                    past_key_values[i][1].expand(batch_size, -1, -1, -1),
+                ]
+            )
+        z = torch.zeros(
+                batch_size, past_key_values[0][0].shape[-2]
+        ).fill_(1).to("cuda")
+
+        # Compute for each batch in dataset
+        total_tokens = 0
+        start = time.time()
+        correct = 0
+        local_result = []
+        for i in range(len(data_new)):
+            inputs = data_new[i].to("cuda")        
+            attention_mask = attn_old[i].to("cuda")
+            pos = attention_mask.sum(-1)
+            attention_mask = torch.cat((z, attention_mask,),dim=-1)
+            inputs["attention_mask"] = attention_mask
+            with torch.no_grad():
+                q = model(**inputs, past_key_values=past_key_values_new)
+            for k in range(len(prompts_batch)):
+                token_output_position = pos[k].item() - 1
+                total_tokens += token_output_position
+                val = tokenizer.decode(q["logits"][k, token_output_position].argmax())
+                local_result.append(val)
+                correct += (val == ("B" if answers[i][k] else "A"))
+            if i % 10 == 10-1:
+                print(correct, "t/s: ", total_tokens / (time.time() - start))
+        results.append(local_result)
+    return results
+
+def load_awq_model():
+  """
+  requires `pip install autoawq` with GPU >= 8.0
+  """
+  from awq import AutoAWQForCausalLM
+  from transformers import AutoTokenizer
+
+  model_name_or_path = "TheBloke/Mistral-7B-Instruct-v0.1-AWQ"
+
+  # Load model
+  model = AutoAWQForCausalLM.from_quantized(model_name_or_path, fuse_layers=False,
+                                            trust_remote_code=False, safetensors=True)
+  tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=False)
+  tokenizer.padding_side="right"
+  tokenizer.pad_token = tokenizer.eos_token
+  return model, tokenizer
+  
 
 def build_tree(
   features: List[List[int]]
