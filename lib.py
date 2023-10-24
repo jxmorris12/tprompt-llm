@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Any, Dict
 
 import math
 import random
@@ -8,8 +8,10 @@ import datasets
 import numpy as np
 import sklearn
 import sklearn.tree
-import ctranslate2
 import transformers
+from collections import Counter
+import torch
+import time
 
 def prepare_dataset(
   dataset: datasets.Dataset,
@@ -86,25 +88,23 @@ def prepare_dataset(
   
   return prompts, (X_train_text, y_train), verbalizer, template
 
-def create_features(
-  prompts: List[str],
-  data: List[str],
-  labels: List[str],
-  model, tokenizer, batch_size = 20
-) -> List[List[int]]:
-    
+
+def create_features(prompts, data, labels, model,
+                    tokenizer, verb_tokenized, template, batch_size = 20):
+    data, labels = zip(*sorted(zip(data, labels), key=lambda x: len(x[0])))
     # Pretokenize and batch.
     data_new = []
     attn_old = []
     answers = []
-    for i in range(0, (len(data)) - batch_size,batch_size):
-        prompts_batch = ["Input: " + data[j] + "\nOutput:" for j in range(i, i + batch_size)]
+    for i in range(0, (len(data)) - batch_size + 1, batch_size):
+        prompts_batch = ["\n" + (template % (data[j], "")).strip()
+                         for j in range(i, i + batch_size)]
         inputs = tokenizer(
             prompts_batch,
             return_tensors="pt",
             return_attention_mask=True,
             padding=True,
-            max_length=128,
+            max_length=256,
             truncation=True
         )
         attn_old.append(inputs["attention_mask"].clone())
@@ -112,18 +112,23 @@ def create_features(
         answers.append(labels[i: i + batch_size])
 
     # Main loop
+    prompt_kvs = []
     results = []
-    for i, prompt in enumerate(prompts):
-        print("Prompting: ", i)
+    for n, prompt in enumerate(prompts):
+        print("Prompting: ", n)
+        print(len(prompt))
         tokens = tokenizer(
-            [prompt + ""],
+            [prompt],
             return_tensors='pt',
-            max_length=2000,
+            max_length=3000,
             truncation=True
         ).to("cuda")
         with torch.no_grad():
             outputs = model.forward(**tokens)
-        
+        kv = outputs["past_key_values"]
+        prompt_kvs.append([(kv[0].to("cpu"), kv[1].to("cpu"))
+                            for kv in outputs["past_key_values"]
+                           ])
         # Setup prompt caching
         past_key_values_new = []
         past_key_values = outputs["past_key_values"]
@@ -142,25 +147,29 @@ def create_features(
         total_tokens = 0
         start = time.time()
         correct = 0
+        total = 0
         local_result = []
         for i in range(len(data_new)):
-            inputs = data_new[i].to("cuda")        
+            inputs = data_new[i].to("cuda")
             attention_mask = attn_old[i].to("cuda")
             pos = attention_mask.sum(-1)
             attention_mask = torch.cat((z, attention_mask,),dim=-1)
             inputs["attention_mask"] = attention_mask
             with torch.no_grad():
                 q = model(**inputs, past_key_values=past_key_values_new)
+                dist = q["logits"].softmax(-1)
             for k in range(len(prompts_batch)):
                 token_output_position = pos[k].item() - 1
                 total_tokens += token_output_position
-                val = tokenizer.decode(q["logits"][k, token_output_position].argmax())
+                val = list([dist[k, token_output_position, v].item()
+                            for _, v in verb_tokenized.items()])
                 local_result.append(val)
-                correct += (val == ("B" if answers[i][k] else "A"))
-            if i % 10 == 10-1:
-                print(correct, "t/s: ", total_tokens / (time.time() - start))
+                correct += torch.tensor(val).argmax().item() == answers[i][k]
+                total += 1
+            if i % 100 == 10-1:
+                print("fs:", correct / total, "t/s: ", total_tokens / (time.time() - start))
         results.append(local_result)
-    return results
+    return results, prompt_kvs, labels
 
 def load_awq_model():
   """
@@ -180,51 +189,91 @@ def load_awq_model():
   return model, tokenizer
 
 
+def run_one(inputs, kv):
+    inputs, attention_mask = inputs
+
+    z = torch.zeros(
+        1, kv[0][0].shape[-2]
+    ).fill_(1).to("cuda")
+    attention_mask = torch.cat((z, attention_mask,),dim=-1)
+    inputs["attention_mask"] = attention_mask
+
+    with torch.no_grad():
+        q = model(**inputs, past_key_values=kv)
+    return q["logits"][0, -1].softmax(-1)
+    # return tokenizer.decode(q["logits"][0, -1].argmax())
+
+cache = {}
+CACHE = 3
+feat_count = Counter()
+def classify(example, tree, node_id, prompt_kvs, verb_tokenized):
+    feat = tree.feature[node_id]
+    L, R = tree.children_left[node_id], tree.children_right[node_id]
+    is_split_node = L != R
+    prompt = feat // len(verb_tokenized)
+    check = feat % len(verb_tokenized)
+    def get_kvs(prompt):
+        feat_count[prompt] += 1
+        if prompt in cache:
+            return cache[prompt]
+        else:
+            if prompt in [a for a, _ in feat_count.most_common(CACHE)]:
+                cache[prompt] = prompt_kvs[prompt].to("cuda")
+                if len(cache) > CACHE:
+                    del cache[feat_count.most_common(CACHE + 1)[-1][0]]
+            return prompt_kvs[prompt].to("cuda")
+
+    if is_split_node:
+        dist = run_one(example, get_kvs(prompt))
+        v = dist[verb_tokenized[check]].item()
+        next = L if v <= tree.threshold[node_id] else R
+        print(feat, prompt, check, v, tree.threshold[node_id])
+        return classify(example, tree, next, prompt_kvs, verb_tokenized)
+    else:
+        print("BOTTOM", tree.value[node_id])
+        ret = tree.value[node_id].argmax()
+        return ret
 
 
-class PromptTree:
-  llm: Any # language model
-  _clf: sklearn.tree.DecisionTreeClassifier # internal decision tree
-  def __init__(
-      self, 
-      llm: Any,
-      prompts: List[str],
-      data: List[str],
-      labels: List[str],
-      verbalizer: Dict[str, str],
-      max_leaf_nodes: int = 10,
-      seed: int = 42
-    ):
-      self.llm = llm
-      self.prompts = prompts
-      prompt_cache, features = create_features(
-          llm=llm, prompts=prompts, data=data, labels=labels
-      )
-      self._clf = sklearn.tree.DecisionTreeClassifier(
-        max_leaf_nodes=max_leaf_nodes,
-        random_state=seed,
-      )
-      X, y = data
-      self._clf_.fit(X, y)
-    
-  def _features_from_text(self, text: List[str]) -> List[List[int]]:
-    raise NotImplementedError
+DATAPOINTS = 2000
+PROMPTS = 20
+BATCH_SIZE = 2
+dataset = datasets.load_dataset("rotten_tomatoes", "train")
+dataset = dataset.shuffle(seed=42)
+prompts, (data, labels), verb, template = prepare_dataset(dataset["train"].select(range(DATAPOINTS)), num_shots=128)
 
-  def predict_proba(self, X_text):
-      prompt_features = self._features_from_text(
-          X_text
-      )
-      return self.clf_.predict_proba(prompt_features)
+model, tokenizer = load_awq_model()
+verb_tokenized = {}
+for k,v in verb.items():
+  verb_tokenized[k] = tokenizer.encode(v)[-1]
 
-  def predict(self, X):
-      labels = self.predict_proba(X).argmax(axis=1)
-      return map(self.verbalizer.get, labels)
+results, prompt_kvs, new_labels = create_features(prompts[:PROMPTS], data, labels, model, tokenizer,
+                                                  verb_tokenized, template, batch_size=BATCH_SIZE)
+print(verb_tokenized)
+result = torch.tensor(results)
+result = result.permute(1, 0, 2).contiguous().view(result.shape[1], -1)
+print(result.shape)
 
-
-prompts, data, verbalizer = prepare_dataset(dataset["train"])
-tree = PromptTree(
-    llm=llm,
-    prompts=prompts,
-    data=data,
-    verbalizer=verbalizer,
+clf = sklearn.tree.DecisionTreeClassifier(
+    max_leaf_nodes = 40
 )
+
+clf.fit(result, new_labels)
+
+prompt_kvs_stack = [torch.stack([torch.stack((kv[0], kv[1])) for kv in kv])
+                    for kv in prompt_kvs]
+
+correct = 0
+total = 0
+for i, p in enumerate(dataset["test"]):
+    prompts_batch = ["\n" + (template % (p["text"], "")).strip()]
+    inputs = tokenizer(
+        prompts_batch,
+        return_tensors="pt",
+        return_attention_mask=True,
+    ).to("cuda")
+
+    correct += (classify((inputs, inputs["attention_mask"].clone()), clf.tree_, 0, prompt_kvs_stack, verb_tokenized) == p["label"])
+    total += 1
+    print(correct / total)
+print("Final:", correct / total)
