@@ -410,7 +410,7 @@ if __name__ == "__main__":
     dataset = dataset.shuffle(seed=42)
     if args.do_train:
         tree.fit(
-            dataset["train"].select(range(1000)),
+            dataset["train"],
             batch_size=args.batch_size,
             save_features=args.save_features,
         )
