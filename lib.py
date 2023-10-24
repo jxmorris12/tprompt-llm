@@ -4,12 +4,13 @@ import datasets
 from typing import Any, Dict, Optional, List, Tuple
 import math
 import numpy as np
-import random 
+import random
 import string
 import torch
-import time 
+import time
 from collections import Counter
 import pickle
+
 
 @dataclass
 class TreeState:
@@ -20,16 +21,19 @@ class TreeState:
     llm: str
     prompt_max_length: int
 
+
 class PromptTree:
-    def __init__(self,   
-                llm: str = "TheBloke/Mistral-7B-Instruct-v0.1-AWQ",
-                template: str = 'Input: %s\nOutput: %s',
-                num_shots: int = 128,
-                num_prompts: int = 40,
-                max_leaf_nodes: int = 40,
-                prompt_max_length: int = 3000,
-                cache_size: int = 3,
-                seed: int = 42):
+    def __init__(
+        self,
+        llm: str = "TheBloke/Mistral-7B-Instruct-v0.1-AWQ",
+        template: str = "Input: %s\nOutput: %s",
+        num_shots: int = 128,
+        num_prompts: int = 40,
+        max_leaf_nodes: int = 40,
+        prompt_max_length: int = 3000,
+        cache_size: int = 3,
+        seed: int = 42,
+    ):
         """
         template (str) - template for combining data point and label
         num_shots (int) - number of data points in context per prompt
@@ -54,24 +58,28 @@ class PromptTree:
     def load(self, path: str):
         self.state = pickle.load(open(path, "rb"))
 
-    def save(self, path : str):
+    def save(self, path: str):
         pickle.dump(self.state, open(path, "wb"))
 
-    def _fill_template(self, x:str) -> str:
+    def _fill_template(self, x: str) -> str:
         return "\n" + (self.state.template % (x, "")).strip()
 
-    def fit(self, 
-            dataset: datasets.Dataset,
-            text_column: str = "text",
-            label_column: str = "label",
-            batch_size: int = 20
-            ):
-        X_train_text, y_train = \
-            self._gen_data(dataset[text_column], dataset[label_column])
-        features = self._create_features(X_train_text, y_train, 
-                                         batch_size)
-        clf = DecisionTreeClassifier(max_leaf_nodes = 40)
-        clf.fit(features, y_train)
+    def fit(
+        self,
+        dataset: datasets.Dataset,
+        text_column: str = "text",
+        label_column: str = "label",
+        batch_size: int = 20,
+        save_features: str = "",
+    ):
+        X_train_text, y_train = self._gen_data(
+            dataset[text_column], dataset[label_column]
+        )
+        features = self._create_features(X_train_text, y_train, batch_size)
+        if save_features:
+            pickle.dump(features, open(save_features, "wb"))
+        clf = DecisionTreeClassifier(max_leaf_nodes=40)
+        clf.fit(features, y_train[: features.shape[0]])
         self.state.tree = clf.tree_
 
     def _gen_data(self, X: List[str], y: List[int]):
@@ -80,12 +88,12 @@ class PromptTree:
         unique_ys = sorted(list(set(y)))
         examples_by_y = {}
         for ys in unique_ys:
-            examples_by_y[ys] = sorted(
-                list(filter(lambda ex: ex[1] == ys, zip(X, y)))
-            )
-            
+            examples_by_y[ys] = sorted(list(filter(lambda ex: ex[1] == ys, zip(X, y))))
+
         num_labels = len(unique_ys)
-        self.state.verbalizer = { ys: L for L, ys in zip(string.ascii_uppercase[:num_labels], unique_ys) }
+        self.state.verbalizer = {
+            ys: L for L, ys in zip(string.ascii_uppercase[:num_labels], unique_ys)
+        }
         self.state.prompts = []
 
         # Create num_prompts prompts
@@ -102,28 +110,26 @@ class PromptTree:
             }
 
             # Take an even number of demonstrations per class, but shuffle them.
-            demo_classes = unique_ys * \
-                math.ceil(self.num_shots //
-                        len(unique_ys))
+            demo_classes = unique_ys * math.ceil(self.num_shots // len(unique_ys))
             random.shuffle(demo_classes)
-            demo_classes = demo_classes[:self.num_shots]
+            demo_classes = demo_classes[: self.num_shots]
 
             for idx, ys in enumerate(demo_classes):
                 text, _ = chosen_examples[ys][idx]
                 prompt += self.state.template % (text, self.state.verbalizer[ys]) + "\n"
             if prompt not in self.state.prompts:
                 self.state.prompts.append(prompt)
-    
+
         return zip(*sorted(zip(X, y), key=lambda x: len(x[0])))
-        
-    @property 
+
+    @property
     def tokenizer(self):
         if self._tokenizer is not None:
             return self._tokenizer
         self._model, self._tokenizer = self._load_llm()
         return self._tokenizer
 
-    @property 
+    @property
     def model(self):
         if self._model is not None:
             return self._model
@@ -139,11 +145,15 @@ class PromptTree:
             print("Prompting: ", n)
             outputs = self._prompt_kv(n)
             kv = outputs["past_key_values"]
-            prompt_kvs.append([(kv[0].to("cpu"), kv[1].to("cpu"))
-                                for kv in outputs["past_key_values"]
-                            ])
-        self._prompt_kvs = [torch.stack([torch.stack((kv[0], kv[1])) for kv in kv])
-                            for kv in prompt_kvs]
+            prompt_kvs.append(
+                [
+                    (kv[0].to("cpu"), kv[1].to("cpu"))
+                    for kv in outputs["past_key_values"]
+                ]
+            )
+        self._prompt_kvs = [
+            torch.stack([torch.stack((kv[0], kv[1])) for kv in kv]) for kv in prompt_kvs
+        ]
         return self._prompt_kvs
 
     @property
@@ -151,7 +161,7 @@ class PromptTree:
         if self._verb_tokenized is not None:
             return self._verb_tokenized
         verb_tokenized = {}
-        for k,v in self.state.verbalizer.items():
+        for k, v in self.state.verbalizer.items():
             verb_tokenized[k] = self.tokenizer.encode(v)[-1]
         self._verb_tokenized = verb_tokenized
         return self._verb_tokenized
@@ -159,16 +169,18 @@ class PromptTree:
     def _prompt_kv(self, i: int) -> torch.Tensor:
         "Create a kv tensor for prompt i"
         tokens = self.tokenizer(
-                [self.state.prompts[i]],
-                return_tensors='pt',
-                max_length=self.state.prompt_max_length,
-                truncation=True
-            ).to("cuda")
+            [self.state.prompts[i]],
+            return_tensors="pt",
+            max_length=self.state.prompt_max_length,
+            truncation=True,
+        ).to("cuda")
         with torch.no_grad():
             outputs = self.model.forward(**tokens)
         return outputs
-        
-    def _create_features(self, data: List[str], labels: List[int], batch_size: int) -> torch.Tensor:
+
+    def _create_features(
+        self, data: List[str], labels: List[int], batch_size: int
+    ) -> torch.Tensor:
         model, tokenizer = self._load_llm()
         verb_tokenized = self.verb_tokenized
 
@@ -176,19 +188,21 @@ class PromptTree:
         data_new = []
         attn_old = []
         answers = []
-        for i in range(0, (len(data)) - batch_size + 1, batch_size):
-            prompts_batch = [self._fill_template(data[j]) for j in range(i, i + batch_size)]
+        for i in range(0, len(data) - batch_size + 1, batch_size):
+            prompts_batch = [
+                self._fill_template(data[j]) for j in range(i, i + batch_size)
+            ]
             inputs = tokenizer(
                 prompts_batch,
                 return_tensors="pt",
                 return_attention_mask=True,
                 padding=True,
                 max_length=256,
-                truncation=True
+                truncation=True,
             )
             attn_old.append(inputs["attention_mask"].clone())
             data_new.append(inputs)
-            answers.append(labels[i: i + batch_size])
+            answers.append(labels[i : i + batch_size])
 
         # Main loop
         prompt_kvs = []
@@ -199,10 +213,13 @@ class PromptTree:
             outputs = self._prompt_kv(n)
 
             kv = outputs["past_key_values"]
-            prompt_kvs.append([(kv[0].to("cpu"), kv[1].to("cpu"))
-                                for kv in outputs["past_key_values"]
-                            ])
-            
+            prompt_kvs.append(
+                [
+                    (kv[0].to("cpu"), kv[1].to("cpu"))
+                    for kv in outputs["past_key_values"]
+                ]
+            )
+
             # Setup prompt caching
             past_key_values_new = []
             past_key_values = outputs["past_key_values"]
@@ -213,9 +230,11 @@ class PromptTree:
                         past_key_values[i][1].expand(batch_size, -1, -1, -1),
                     ]
                 )
-            z = torch.zeros(
-                    batch_size, past_key_values[0][0].shape[-2]
-            ).fill_(1).to("cuda")
+            z = (
+                torch.zeros(batch_size, past_key_values[0][0].shape[-2])
+                .fill_(1)
+                .to("cuda")
+            )
 
             # Compute for each batch in dataset
             total_tokens = 0
@@ -227,33 +246,51 @@ class PromptTree:
                 inputs = data_new[i].to("cuda")
                 attention_mask = attn_old[i].to("cuda")
                 pos = attention_mask.sum(-1)
-                attention_mask = torch.cat((z, attention_mask,),dim=-1)
+                attention_mask = torch.cat(
+                    (
+                        z,
+                        attention_mask,
+                    ),
+                    dim=-1,
+                )
                 inputs["attention_mask"] = attention_mask
                 with torch.no_grad():
                     q = model(**inputs, past_key_values=past_key_values_new)
-                    dist = q["logits"].softmax(-1)
+                    dist = (q["logits"] * 1000).softmax(-1)
                 for k in range(len(prompts_batch)):
                     token_output_position = pos[k].item() - 1
                     total_tokens += token_output_position
-                    val = list([dist[k, token_output_position, v].item()
-                                for _, v in verb_tokenized.items()])
+                    val = list(
+                        [
+                            dist[k, token_output_position, v].item()
+                            for _, v in verb_tokenized.items()
+                        ]
+                    )
                     local_result.append(val)
                     correct += torch.tensor(val).argmax().item() == answers[i][k]
                     total += 1
-                if i % 100 == 10-1:
-                    print("fs:", correct / total, "t/s: ", total_tokens / (time.time() - start))
+                if i % 100 == 10 - 1:
+                    print(
+                        "fs:",
+                        correct / total,
+                        "t/s: ",
+                        total_tokens / (time.time() - start),
+                    )
             results.append(local_result)
         results = torch.tensor(results)
         results = results.permute(1, 0, 2).contiguous().view(results.shape[1], -1)
-        
-        self._prompt_kvs = [torch.stack([torch.stack((kv[0], kv[1])) for kv in kv])
-                            for kv in prompt_kvs]
+
+        self._prompt_kvs = [
+            torch.stack([torch.stack((kv[0], kv[1])) for kv in kv]) for kv in prompt_kvs
+        ]
         return results
 
-    def predict(self,             
-             dataset: datasets.Dataset,
-             text_column: str = "text",
-             label_column: str = "label"):
+    def predict(
+        self,
+        dataset: datasets.Dataset,
+        text_column: str = "text",
+        label_column: str = "label",
+    ):
         correct = 0
         total = 0
         for i, p in enumerate(dataset):
@@ -263,25 +300,34 @@ class PromptTree:
                 return_tensors="pt",
                 return_attention_mask=True,
             ).to("cuda")
-            correct += (self._classify((inputs, inputs["attention_mask"].clone()), 0) == p["label"])
+            correct += (
+                self._classify((inputs, inputs["attention_mask"].clone()), 0)
+                == p["label"]
+            )
             total += 1
             if i % 100 == 0:
                 print(correct / total)
         print("Final:", correct / total)
-
 
     def _load_llm(self) -> Tuple[Any, Any]:
         if self._model is not None:
             return self._model, self._tokenizer
         from awq import AutoAWQForCausalLM
         from transformers import AutoTokenizer
+
         model_name_or_path = self.state.llm
 
         # Load model
-        model = AutoAWQForCausalLM.from_quantized(model_name_or_path, fuse_layers=False,
-                                                    trust_remote_code=False, safetensors=True)
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=False)
-        tokenizer.padding_side="right"
+        model = AutoAWQForCausalLM.from_quantized(
+            model_name_or_path,
+            fuse_layers=False,
+            trust_remote_code=False,
+            safetensors=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path, trust_remote_code=False
+        )
+        tokenizer.padding_side = "right"
         tokenizer.pad_token = tokenizer.eos_token
         self._model = model
         self._tokenizer = tokenizer
@@ -291,29 +337,32 @@ class PromptTree:
         kv = self._get_kvs(prompt)
         model, _ = self._load_llm()
         inputs, attention_mask = inputs
-        z = torch.zeros(
-            1, kv[0][0].shape[-2]
-        ).fill_(1).to("cuda")
-        attention_mask = torch.cat((z, attention_mask,),dim=-1)
+        z = torch.zeros(1, kv[0][0].shape[-2]).fill_(1).to("cuda")
+        attention_mask = torch.cat(
+            (
+                z,
+                attention_mask,
+            ),
+            dim=-1,
+        )
         inputs["attention_mask"] = attention_mask
         with torch.no_grad():
             q = model(**inputs, past_key_values=kv)
-        return q["logits"][0, -1].softmax(-1)
+        return (q["logits"][0, -1] * 1000).softmax(-1)
 
     def _get_kvs(self, prompt: int) -> torch.Tensor:
         "Gets a key value vector for a prompt"
         self.feat_count[prompt] += 1
         if prompt in self.cache:
             return self.cache[prompt]
-        
+
         if prompt in [a for a, _ in self.feat_count.most_common(self.CACHE)]:
             self.cache[prompt] = self.prompt_kvs[prompt].to("cuda")
             if len(self.cache) > self.CACHE:
                 del self.cache[self.feat_count.most_common(self.CACHE + 1)[-1][0]]
         return self.prompt_kvs[prompt].to("cuda")
 
-
-    def _classify(self, example: Tuple[str, torch.Tensor] , node_id: int) -> int:
+    def _classify(self, example: Tuple[str, torch.Tensor], node_id: int) -> int:
         tree = self.state.tree
         feat = tree.feature[node_id]
         L, R = tree.children_left[node_id], tree.children_right[node_id]
@@ -329,8 +378,10 @@ class PromptTree:
             ret = tree.value[node_id].argmax()
             return ret
 
+
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="rotten_tomatoes")
     parser.add_argument("--num_shots", type=int, default=128)
@@ -343,20 +394,26 @@ if __name__ == "__main__":
     parser.add_argument("--file_name", type=str, default="tree.pkl")
     parser.add_argument("--do_train", action="store_true")
     parser.add_argument("--do_test", action="store_true")
+    parser.add_argument("--save_features", type=str, default="")
     args = parser.parse_args()
 
     dataset = datasets.load_dataset(args.dataset)
-    tree = PromptTree(num_shots=args.num_shots,
-                      num_prompts=args.num_prompts,
-                      max_leaf_nodes=args.max_leaf_nodes,
-                      prompt_max_length=args.prompt_max_length,
-                      cache_size=args.cache_size,
-                      seed=args.seed)
+    tree = PromptTree(
+        num_shots=args.num_shots,
+        num_prompts=args.num_prompts,
+        max_leaf_nodes=args.max_leaf_nodes,
+        prompt_max_length=args.prompt_max_length,
+        cache_size=args.cache_size,
+        seed=args.seed,
+    )
     dataset = datasets.load_dataset(args.dataset, "train")
     dataset = dataset.shuffle(seed=42)
     if args.do_train:
-        tree.fit(dataset["train"].select(range(1000)),                       
-                 batch_size=args.batch_size,)
+        tree.fit(
+            dataset["train"].select(range(1000)),
+            batch_size=args.batch_size,
+            save_features=args.save_features,
+        )
         tree.save(args.file_name)
     else:
         tree.load(args.file_name)
