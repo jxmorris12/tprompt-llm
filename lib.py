@@ -75,7 +75,24 @@ class PromptTree:
         X_train_text, y_train = self._gen_data(
             dataset[text_column], dataset[label_column]
         )
-        features = self._create_features(X_train_text, y_train, batch_size)
+        features = self._create_features(
+            X_train_text, y_train, n_prompts=1, batch_size=batch_size, temperature=1
+        )
+        features = features.view(-1, len(self.state.verbalizer))
+        entropy = -torch.sum(features * features.log(), dim=-1)
+        _, positions = entropy.topk(500)
+        positions = positions.sort()[0].tolist()
+        X_train_text, y_train = list([X_train_text[p] for p in positions]), list(
+            [y_train[p] for p in positions]
+        )
+        features = self._create_features(
+            X_train_text,
+            y_train,
+            n_prompts=self.num_prompts,
+            batch_size=batch_size,
+            temperature=1000,
+        )
+
         if save_features:
             pickle.dump(features, open(save_features, "wb"))
         clf = DecisionTreeClassifier(max_leaf_nodes=40)
@@ -179,7 +196,12 @@ class PromptTree:
         return outputs
 
     def _create_features(
-        self, data: List[str], labels: List[int], batch_size: int
+        self,
+        data: List[str],
+        labels: List[int],
+        batch_size: int,
+        temperature: float = 1,
+        n_prompts: int = 1,
     ) -> torch.Tensor:
         model, tokenizer = self._load_llm()
         verb_tokenized = self.verb_tokenized
@@ -207,9 +229,9 @@ class PromptTree:
         # Main loop
         prompt_kvs = []
         results = []
-        for n, prompt in enumerate(self.state.prompts):
+        for n in range(n_prompts):
             print("Prompting: ", n)
-            print(len(prompt))
+
             outputs = self._prompt_kv(n)
 
             kv = outputs["past_key_values"]
@@ -256,7 +278,7 @@ class PromptTree:
                 inputs["attention_mask"] = attention_mask
                 with torch.no_grad():
                     q = model(**inputs, past_key_values=past_key_values_new)
-                    dist = (q["logits"] * 1000).softmax(-1)
+                    dist = (q["logits"] * temperature).softmax(-1)
                 for k in range(len(prompts_batch)):
                     token_output_position = pos[k].item() - 1
                     total_tokens += token_output_position
@@ -410,7 +432,7 @@ if __name__ == "__main__":
     dataset = dataset.shuffle(seed=42)
     if args.do_train:
         tree.fit(
-            dataset["train"],
+            dataset["train"].select(range(100)),
             batch_size=args.batch_size,
             save_features=args.save_features,
         )
