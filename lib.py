@@ -10,6 +10,7 @@ import torch
 import time
 from collections import Counter
 import pickle
+import json
 
 
 @dataclass
@@ -33,6 +34,7 @@ class PromptTree:
         prompt_max_length: int = 3000,
         cache_size: int = 3,
         seed: int = 42,
+        entropy_filter: int = 0,
     ):
         """
         template (str) - template for combining data point and label
@@ -43,6 +45,7 @@ class PromptTree:
         self.state = TreeState(None, None, template, None, llm, prompt_max_length)
         self.num_shots = num_shots
         self.num_prompts = num_prompts
+        self.entropy_filter = entropy_filter
         self.seed = seed
 
         self.cache = {}
@@ -67,24 +70,26 @@ class PromptTree:
     def fit(
         self,
         dataset: datasets.Dataset,
+        verbalizer: Dict[str, str],
         text_column: str = "text",
         label_column: str = "label",
         batch_size: int = 20,
         save_features: str = "",
     ):
         X_train_text, y_train = self._gen_data(
-            dataset[text_column], dataset[label_column]
+            dataset[text_column], dataset[label_column], verbalizer
         )
-        features = self._create_features(
-            X_train_text, y_train, n_prompts=1, batch_size=batch_size, temperature=1
-        )
-        features = features.view(-1, len(self.state.verbalizer))
-        entropy = -torch.sum(features * features.log(), dim=-1)
-        _, positions = entropy.topk(500)
-        positions = positions.sort()[0].tolist()
-        X_train_text, y_train = list([X_train_text[p] for p in positions]), list(
-            [y_train[p] for p in positions]
-        )
+        if self.entropy_filter:
+            features = self._create_features(
+                X_train_text, y_train, n_prompts=1, batch_size=batch_size, temperature=1
+            )
+            features = features.view(-1, len(self.state.verbalizer))
+            entropy = -torch.sum(features * features.log(), dim=-1)
+            _, positions = entropy.topk(self.entropy_filter)
+            positions = positions.sort()[0].tolist()
+            X_train_text, y_train = list([X_train_text[p] for p in positions]), list(
+                [y_train[p] for p in positions]
+            )
         features = self._create_features(
             X_train_text,
             y_train,
@@ -99,7 +104,7 @@ class PromptTree:
         clf.fit(features, y_train[: features.shape[0]])
         self.state.tree = clf.tree_
 
-    def _gen_data(self, X: List[str], y: List[int]):
+    def _gen_data(self, X: List[str], y: List[int], verbalizer: Dict[str, str]):
         rng = np.random.default_rng(seed=self.seed)
 
         unique_ys = sorted(list(set(y)))
@@ -107,10 +112,7 @@ class PromptTree:
         for ys in unique_ys:
             examples_by_y[ys] = sorted(list(filter(lambda ex: ex[1] == ys, zip(X, y))))
 
-        num_labels = len(unique_ys)
-        self.state.verbalizer = {
-            ys: L for L, ys in zip(string.ascii_uppercase[:num_labels], unique_ys)
-        }
+        self.state.verbalizer = verbalizer
         self.state.prompts = []
 
         # Create num_prompts prompts
@@ -133,7 +135,12 @@ class PromptTree:
 
             for idx, ys in enumerate(demo_classes):
                 text, _ = chosen_examples[ys][idx]
-                prompt += self.state.template % (text, self.state.verbalizer[ys]) + "\n"
+                prompt += (
+                    self.state.template % (text, self.state.verbalizer[str(ys)]) + "\n"
+                )
+            prompt += (
+                "\nOptions are " + ", ".join(self.state.verbalizer.values()) + "\n"
+            )
             if prompt not in self.state.prompts:
                 self.state.prompts.append(prompt)
 
@@ -160,6 +167,7 @@ class PromptTree:
         prompt_kvs = []
         for n, prompt in enumerate(self.state.prompts):
             print("Prompting: ", n)
+            # print(prompt)
             outputs = self._prompt_kv(n)
             kv = outputs["past_key_values"]
             prompt_kvs.append(
@@ -185,6 +193,8 @@ class PromptTree:
 
     def _prompt_kv(self, i: int) -> torch.Tensor:
         "Create a kv tensor for prompt i"
+        print(self.state.prompts[i])
+        self.tokenizer.padding_side = "left"
         tokens = self.tokenizer(
             [self.state.prompts[i]],
             return_tensors="pt",
@@ -214,6 +224,7 @@ class PromptTree:
             prompts_batch = [
                 self._fill_template(data[j]) for j in range(i, i + batch_size)
             ]
+            tokenizer.padding_side = "right"
             inputs = tokenizer(
                 prompts_batch,
                 return_tensors="pt",
@@ -224,7 +235,10 @@ class PromptTree:
             )
             attn_old.append(inputs["attention_mask"].clone())
             data_new.append(inputs)
-            answers.append(labels[i : i + batch_size])
+            l = list(verb_tokenized.keys())
+            answers.append(
+                list([l.index(str(lab)) for lab in labels[i : i + batch_size]])
+            )
 
         # Main loop
         prompt_kvs = []
@@ -265,6 +279,7 @@ class PromptTree:
             total = 0
             local_result = []
             for i in range(len(data_new)):
+                # print(self._fill_template(data[i]))
                 inputs = data_new[i].to("cuda")
                 attention_mask = attn_old[i].to("cuda")
                 pos = attention_mask.sum(-1)
@@ -282,13 +297,11 @@ class PromptTree:
                 for k in range(len(prompts_batch)):
                     token_output_position = pos[k].item() - 1
                     total_tokens += token_output_position
-                    val = list(
-                        [
-                            dist[k, token_output_position, v].item()
-                            for _, v in verb_tokenized.items()
-                        ]
-                    )
+                    val = [0] * len(verb_tokenized)
+                    for p, (_, v) in enumerate(verb_tokenized.items()):
+                        val[p] = dist[k, token_output_position, v].item()
                     local_result.append(val)
+                    # print(answers[i][k], torch.tensor(val).argmax().item(), val)
                     correct += torch.tensor(val).argmax().item() == answers[i][k]
                     total += 1
                 if i % 100 == 10 - 1:
@@ -316,7 +329,8 @@ class PromptTree:
         correct = 0
         total = 0
         for i, p in enumerate(dataset):
-            prompts_batch = [self._fill_template(p["text"])]
+            prompts_batch = [self._fill_template(p[text_column])]
+            self.tokenizer.padding_side = "right"
             inputs = self.tokenizer(
                 prompts_batch,
                 return_tensors="pt",
@@ -349,7 +363,6 @@ class PromptTree:
         tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path, trust_remote_code=False
         )
-        tokenizer.padding_side = "right"
         tokenizer.pad_token = tokenizer.eos_token
         self._model = model
         self._tokenizer = tokenizer
@@ -391,9 +404,10 @@ class PromptTree:
         is_split_node = L != R
         prompt = feat // len(self.verb_tokenized)
         check = feat % len(self.verb_tokenized)
+        val = list(self.verb_tokenized.values())
         if is_split_node:
             dist = self._run_one(example, prompt)
-            v = dist[self.verb_tokenized[check]].item()
+            v = dist[val[check]].item()
             next = L if v <= tree.threshold[node_id] else R
             return self._classify(example, next)
         else:
@@ -406,12 +420,15 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="rotten_tomatoes")
+    parser.add_argument("--verbalizer", type=str, default="")
+    parser.add_argument("--text_column", type=str, default="sentence")
     parser.add_argument("--num_shots", type=int, default=128)
     parser.add_argument("--num_prompts", type=int, default=40)
     parser.add_argument("--max_leaf_nodes", type=int, default=40)
     parser.add_argument("--prompt_max_length", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=20)
+    parser.add_argument("--entropy_filter", type=int, default=0)
     parser.add_argument("--cache_size", type=int, default=3)
     parser.add_argument("--file_name", type=str, default="tree.pkl")
     parser.add_argument("--do_train", action="store_true")
@@ -428,11 +445,13 @@ if __name__ == "__main__":
         cache_size=args.cache_size,
         seed=args.seed,
     )
-    dataset = datasets.load_dataset(args.dataset, "train")
+    dataset = datasets.load_dataset(args.dataset)
     dataset = dataset.shuffle(seed=42)
     if args.do_train:
         tree.fit(
-            dataset["train"].select(range(100)),
+            dataset["train"],
+            json.load(open(args.verbalizer, "r")),
+            args.text_column,
             batch_size=args.batch_size,
             save_features=args.save_features,
         )
@@ -440,4 +459,4 @@ if __name__ == "__main__":
     else:
         tree.load(args.file_name)
     if args.do_test:
-        tree.predict(dataset["test"])
+        tree.predict(dataset["test"], args.text_column)
