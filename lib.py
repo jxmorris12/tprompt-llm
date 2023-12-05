@@ -27,7 +27,7 @@ class PromptTree:
     def __init__(
         self,
         llm: str = "TheBloke/Mistral-7B-Instruct-v0.1-AWQ",
-        template: str = "Input: %s\nOutput: %s",
+        template: str = "Input: %s\nClass: %s",
         num_shots: int = 128,
         num_prompts: int = 40,
         max_leaf_nodes: int = 40,
@@ -64,8 +64,9 @@ class PromptTree:
     def save(self, path: str):
         pickle.dump(self.state, open(path, "wb"))
 
-    def _fill_template(self, x: str) -> str:
-        return "\n" + (self.state.template % (x, "")).strip()
+    def _fill_template(self, x: str, y:str="") -> str:
+        x = self.tokenizer.convert_tokens_to_string(self.tokenizer.tokenize(x)[:128])
+        return "\n" + (self.state.template % (x, y)).strip()
 
     def fit(
         self,
@@ -95,7 +96,7 @@ class PromptTree:
             y_train,
             n_prompts=self.num_prompts,
             batch_size=batch_size,
-            temperature=1000,
+            temperature=1,
         )
 
         if save_features:
@@ -135,16 +136,14 @@ class PromptTree:
 
             for idx, ys in enumerate(demo_classes):
                 text, _ = chosen_examples[ys][idx]
-                prompt += (
-                    self.state.template % (text, self.state.verbalizer[str(ys)]) + "\n"
-                )
+                prompt += self._fill_template(text, self.state.verbalizer[str(ys)]) + "\n"
             prompt += (
-                "\nOptions are " + ", ".join(self.state.verbalizer.values()) + "\n"
+                "\nInstruction - Output only of the following choices :" + " ".join(self.state.verbalizer.values()) + ". Do not output anything else.\n"
             )
             if prompt not in self.state.prompts:
                 self.state.prompts.append(prompt)
 
-        return zip(*sorted(zip(X, y), key=lambda x: len(x[0])))
+        return zip(*sorted(zip(X, y), key=lambda x: len(x[0]), reverse=True))
 
     @property
     def tokenizer(self):
@@ -230,7 +229,7 @@ class PromptTree:
                 return_tensors="pt",
                 return_attention_mask=True,
                 padding=True,
-                max_length=256,
+                max_length=164,
                 truncation=True,
             )
             attn_old.append(inputs["attention_mask"].clone())
@@ -279,7 +278,7 @@ class PromptTree:
             total = 0
             local_result = []
             for i in range(len(data_new)):
-                # print(self._fill_template(data[i]))
+                print(self._fill_template(data[i]))
                 inputs = data_new[i].to("cuda")
                 attention_mask = attn_old[i].to("cuda")
                 pos = attention_mask.sum(-1)
@@ -301,6 +300,7 @@ class PromptTree:
                     for p, (_, v) in enumerate(verb_tokenized.items()):
                         val[p] = dist[k, token_output_position, v].item()
                     local_result.append(val)
+                    # print(tokenizer.decode([dist[k, token_output_position].argmax().item()]))
                     # print(answers[i][k], torch.tensor(val).argmax().item(), val)
                     correct += torch.tensor(val).argmax().item() == answers[i][k]
                     total += 1
