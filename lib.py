@@ -26,7 +26,7 @@ class TreeState:
 class PromptTree:
     def __init__(
         self,
-        llm: str = "TheBloke/Mistral-7B-Instruct-v0.1-AWQ",
+        llm: str = "TheBloke/Mistral-7B-v0.1-AWQ",
         template: str = "Input: %s\nClass: %s",
         num_shots: int = 128,
         num_prompts: int = 40,
@@ -138,7 +138,7 @@ class PromptTree:
                 text, _ = chosen_examples[ys][idx]
                 prompt += self._fill_template(text, self.state.verbalizer[str(ys)]) + "\n"
             prompt += (
-                "\nInstruction - Output only of the following choices :" + " ".join(self.state.verbalizer.values()) + ". Do not output anything else.\n"
+                "\nInstruction - Output only of the following choices : " + " ".join(self.state.verbalizer.values()) + ". Do not output anything else.\n"
             )
             if prompt not in self.state.prompts:
                 self.state.prompts.append(prompt)
@@ -278,7 +278,7 @@ class PromptTree:
             total = 0
             local_result = []
             for i in range(len(data_new)):
-                print(self._fill_template(data[i]))
+                # print(self._fill_template(data[i]))
                 inputs = data_new[i].to("cuda")
                 attention_mask = attn_old[i].to("cuda")
                 pos = attention_mask.sum(-1)
